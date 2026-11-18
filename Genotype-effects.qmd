@@ -1,0 +1,273 @@
+---
+title: "ALOX15 knockout"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source("R/setup.R")
+```
+
+```{r}
+#| label: load
+#| include: false
+
+de <- readRDS("data/de_results.rds")
+logcpm <- readRDS("data/logcpm.rds")
+y2 <- readRDS("data/y2.rds")
+samples <- y2$samples %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::mutate(group = factor(group, levels = group_levels))
+```
+
+## Overview
+
+ALOX15 (12/15-lipoxygenase) oxidises arachidonic and linoleic acid into lipid mediators such as 15-HETE and 12-HETE. In airway epithelium and alternatively activated macrophages it is strongly induced by IL-4 and IL-13. The second factor of this dataset asks how the lung transcriptome changes when *Alox15* is deleted, at baseline and after HDM challenge. This chapter covers the three genotype contrasts defined in the [differential expression chapter](Statistical-analysis.qmd).
+
+## *Alox15* expression
+
+A first check in any knockout dataset is the expression of the deleted gene itself.
+
+```{r}
+#| label: fig-alox15
+#| fig-cap: "Alox15 expression (TMM logCPM) per mouse. Bars show the group mean."
+#| fig-width: 6
+#| fig-height: 4.5
+
+alox <- samples %>%
+  dplyr::mutate(logCPM = logcpm["Alox15", sample])
+
+alox_means <- alox %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(logCPM), .groups = "drop")
+
+p_alox <- ggplot(alox, aes(group, logCPM, colour = group)) +
+  geom_crossbar(data = alox_means, aes(y = mean, ymin = mean, ymax = mean),
+                width = 0.5, colour = "grey30", linewidth = 0.4) +
+  geom_jitter(width = 0.12, size = 2.5) +
+  scale_colour_manual(values = group_colours, guide = "none") +
+  scale_x_discrete(labels = group_labels) +
+  labs(x = NULL, y = expression(italic(Alox15)~"logCPM"))
+
+save_plot(p_alox, "alox15_expression.png", width = 6, height = 4.5)
+p_alox
+```
+
+```{r}
+#| label: alox15-stats
+#| include: false
+
+alox_fc <- purrr::map_dfr(de, ~ dplyr::filter(.x, SYMBOL == "Alox15"), .id = "contrast")
+```
+
+HDM induces *Alox15* in wild-type lungs (log2FC = `r round(alox_fc$logFC[alox_fc$contrast == "HDM_in_WT"], 2)`, FDR = `r signif(alox_fc$FDR[alox_fc$contrast == "HDM_in_WT"], 2)`), as expected for an IL-13 target. But gene-level *Alox15* reads are **not** lower in the knockout groups. They are higher (KO vs WT saline: log2FC = `r round(alox_fc$logFC[alox_fc$contrast == "KO_baseline"], 2)`).
+
+This does not by itself mean that the samples are mislabelled. Many knockout alleles are made by inserting a selection cassette into one exon, or by deleting a few exons. The resulting transcript is often still made, and may be stabilised, so it is counted at gene level. The deposited counts are gene-level, so they cannot tell an intact transcript from a disrupted one. Checking this properly would need read coverage across *Alox15* exons from the raw reads (available on SRA). Group labels in this book follow the GEO sample annotation. The rest of this chapter shows that the genotype contrasts behave like a real knockout line: the expected passenger-gene signature sits around the *Alox15* locus.
+
+## Separating genotype from tissue artefacts
+
+The [QC chapter](QC.qmd#tissue-contamination) found two signals that are confounded with genotype: more red-blood-cell RNA in both knockout groups, and liver RNA in every KO HDM lung. Neither can be modelled away, so genes on the liver and erythrocyte marker lists are flagged in every results table. The table below shows how many genotype hits they account for. All later summaries in this chapter use only unflagged genes.
+
+```{r}
+#| label: tbl-genotype-summary
+#| tbl-cap: "Differentially expressed genes for the genotype contrasts (FDR < 0.05), split by tissue-marker flag."
+
+geno_ct <- c(KO_baseline = "KO vs WT, saline", KO_with_HDM = "KO vs WT, HDM",
+             Interaction = "Interaction (HDM response, KO vs WT)")
+
+purrr::imap_dfr(de[names(geno_ct)], function(d, ct) {
+  s <- dplyr::filter(d, FDR < fdr_cutoff)
+  tibble::tibble(
+    Comparison = geno_ct[[ct]],
+    `DE genes` = nrow(s),
+    `Red blood cell markers` = sum(s$tissue_flag %in% "Red blood cells"),
+    `Liver markers` = sum(s$tissue_flag %in% "Liver"),
+    `Unflagged up` = sum(is.na(s$tissue_flag) & s$logFC > 0),
+    `Unflagged down` = sum(is.na(s$tissue_flag) & s$logFC < 0)
+  )
+}) %>%
+  nice_table()
+
+de_clean <- purrr::map(de, ~ dplyr::filter(.x, is.na(tissue_flag)))
+```
+
+Allergen challenge changes thousands of genes. Genotype at baseline changes about 140 unflagged genes, and about 1,400 after HDM. That larger number is mostly the interaction described further down.
+
+## Passenger genes around the *Alox15* locus
+
+```{r}
+#| label: tbl-ko-baseline
+#| tbl-cap: "Top unflagged genes differing between ALOX15 KO and WT lungs at baseline (saline), ranked by P value."
+
+de_clean$KO_baseline %>%
+  dplyr::filter(FDR < fdr_cutoff) %>%
+  dplyr::slice_min(PValue, n = 15) %>%
+  dplyr::transmute(Gene = SYMBOL, Description = GENENAME, logFC, logCPM,
+                   FDR = signif(FDR, 2)) %>%
+  nice_table(digits = 2)
+```
+
+Knockout mice are usually made in 129-strain embryonic stem cells and then backcrossed to C57BL/6. The 129-derived DNA around the targeted gene is inherited along with the knockout allele, however many generations of backcrossing follow. Genes in that flanking region differ between KO and WT mice because of strain polymorphisms, not because ALOX15 is missing. These **passenger genes** have a recognisable signature: they differ by genotype in every condition, and they cluster on the chromosome of the targeted gene.
+
+```{r}
+#| label: chr-locations
+#| include: false
+
+loc <- suppressWarnings(suppressMessages(
+  AnnotationDbi::select(org.Mm.eg.db, keys = na.omit(unique(de$KO_baseline$ENTREZID)),
+                        columns = c("CHR", "CHRLOC"), keytype = "ENTREZID")
+)) %>%
+  dplyr::filter(CHR == CHRLOCCHR | is.na(CHRLOCCHR)) %>%
+  dplyr::distinct(ENTREZID, .keep_all = TRUE) %>%
+  dplyr::transmute(ENTREZID, CHR, Mb = abs(CHRLOC) / 1e6)
+
+alox_mb <- loc$Mb[match(de$KO_baseline$ENTREZID[de$KO_baseline$SYMBOL == "Alox15"], loc$ENTREZID)]
+
+consistent <- dplyr::inner_join(
+  de_clean$KO_baseline %>% dplyr::filter(FDR < fdr_cutoff) %>% dplyr::select(SYMBOL, ENTREZID, saline = logFC),
+  de_clean$KO_with_HDM %>% dplyr::filter(FDR < fdr_cutoff) %>% dplyr::select(SYMBOL, hdm = logFC),
+  by = "SYMBOL"
+) %>%
+  dplyr::filter(sign(saline) == sign(hdm)) %>%
+  dplyr::left_join(loc, by = "ENTREZID")
+
+base_sig <- de_clean$KO_baseline %>% dplyr::filter(FDR < fdr_cutoff) %>% dplyr::left_join(loc, by = "ENTREZID")
+chr11_expected <- mean(dplyr::left_join(de_clean$KO_baseline, loc, by = "ENTREZID")$CHR == "11", na.rm = TRUE)
+```
+
+`r nrow(consistent)` unflagged genes differ between KO and WT in the same direction in *both* saline and HDM lungs. Of these, **`r sum(consistent$CHR == "11", na.rm = TRUE)` lie on chromosome 11**, the chromosome that carries *Alox15* (`r round(alox_mb, 1)` Mb). Chromosome 11 holds only `r percent(chr11_expected, 1)` of all tested genes.
+
+```{r}
+#| label: fig-passenger
+#| fig-cap: "Passenger-gene signature. (A) Chromosomes of unflagged genes that differ between KO and WT lungs at baseline (FDR < 0.05). (B) Genes that differ by genotype in both saline and HDM lungs, plotted by position on chromosome 11; the dashed line marks Alox15."
+#| fig-width: 11
+#| fig-height: 4.5
+
+p_chr <- base_sig %>%
+  dplyr::filter(CHR %in% c(1:19, "X")) %>%
+  dplyr::mutate(CHR = factor(CHR, levels = c(1:19, "X"))) %>%
+  dplyr::count(CHR, .drop = FALSE) %>%
+  ggplot(aes(CHR, n, fill = CHR == "11")) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = c(`TRUE` = "#D55E00", `FALSE` = "grey65"), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Chromosome", y = "DE genes, KO vs WT (saline)", tag = "A")
+
+chr11 <- consistent %>% dplyr::filter(CHR == "11")
+
+p_pos <- ggplot(chr11, aes(Mb, saline)) +
+  geom_vline(xintercept = alox_mb, linetype = "dashed", colour = "#D55E00") +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_point(size = 2.5, colour = "grey20") +
+  ggrepel::geom_text_repel(aes(label = SYMBOL), size = 3, fontface = "italic",
+                           max.overlaps = Inf, min.segment.length = 0, seed = 1) +
+  scale_x_continuous(limits = c(0, 125)) +
+  labs(x = "Chromosome 11 position (Mb)", y = "log2FC, KO vs WT (saline)", tag = "B")
+
+p_pass <- p_chr + p_pos + plot_layout(widths = c(1, 1.3))
+save_plot(p_pass, "ko_passenger_genes.png", width = 11, height = 4.5)
+p_pass
+```
+
+The genes cluster in a block of about 50 Mb (roughly 43–97 Mb) that contains *Alox15*. This is the classic footprint of a 129-derived congenic interval, and it is good evidence that the genotype labels are correct. It also means that genes in this interval, including *Pttg1* and the interferon-inducible *Xaf1*, cannot be read as consequences of ALOX15 loss.
+
+## Is the HDM response different without ALOX15?
+
+The interaction contrast tests whether the HDM effect differs between genotypes. Plotting each gene's HDM fold change in KO against WT shows the overall agreement.
+
+```{r}
+#| label: fig-response-scatter
+#| fig-cap: "HDM response in ALOX15 KO versus WT lungs. Each point is an unflagged gene; genes with a significant interaction (FDR < 0.05) are coloured and the strongest are labelled. The dashed line is y = x."
+#| fig-width: 7
+#| fig-height: 6.5
+
+resp <- de_clean$HDM_in_WT %>%
+  dplyr::select(SYMBOL, WT = logFC, FDR_WT = FDR) %>%
+  dplyr::inner_join(de_clean$HDM_in_KO %>% dplyr::select(SYMBOL, KO = logFC), by = "SYMBOL") %>%
+  dplyr::inner_join(de_clean$Interaction %>% dplyr::select(SYMBOL, int_logFC = logFC, int_FDR = FDR, int_P = PValue), by = "SYMBOL") %>%
+  dplyr::mutate(
+    class = dplyr::case_when(
+      int_FDR < fdr_cutoff & int_logFC > 0 ~ "Stronger response in KO",
+      int_FDR < fdr_cutoff & int_logFC < 0 ~ "Weaker response in KO",
+      TRUE ~ "No interaction"
+    )
+  )
+
+r_resp <- with(dplyr::filter(resp, FDR_WT < fdr_cutoff), cor(WT, KO))
+slope_resp <- with(dplyr::filter(resp, FDR_WT < fdr_cutoff), coef(lm(KO ~ WT))[2])
+
+lab_int <- resp %>% dplyr::filter(class != "No interaction") %>% dplyr::slice_min(int_P, n = 16)
+
+p_resp <- ggplot(resp, aes(WT, KO)) +
+  geom_point(data = dplyr::filter(resp, class == "No interaction"), colour = "grey75", size = 0.6, alpha = 0.6) +
+  geom_point(data = dplyr::filter(resp, class != "No interaction"), aes(colour = class), size = 1.4, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey30") +
+  ggrepel::geom_text_repel(data = lab_int, aes(label = SYMBOL), size = 3, fontface = "italic",
+                           max.overlaps = Inf, min.segment.length = 0, seed = 1) +
+  scale_colour_manual(values = c("Stronger response in KO" = "#D55E00", "Weaker response in KO" = "#0072B2"),
+                      name = NULL) +
+  coord_equal() +
+  labs(x = "HDM log2FC in WT", y = "HDM log2FC in ALOX15 KO") +
+  theme(legend.position = "top")
+
+save_plot(p_resp, "hdm_response_wt_vs_ko.png", width = 7, height = 6.5)
+p_resp
+```
+
+For genes changed by HDM in wild-type lungs, fold changes in the knockout correlate at r = `r round(r_resp, 2)`, with a slope of `r round(slope_resp, 2)`. The core allergic response is preserved without ALOX15. It is, if anything, slightly larger: the KO contrast also detects more DE genes than the WT one ([Differential expression](Statistical-analysis.qmd#summary-of-all-contrasts)).
+
+```{r}
+#| label: interaction-go
+#| include: false
+
+int_up <- de_clean$Interaction %>% dplyr::filter(FDR < fdr_cutoff, logFC > 0)
+go_int <- clusterProfiler::enrichGO(
+  na.omit(int_up$ENTREZID), OrgDb = org.Mm.eg.db, ont = "BP",
+  universe = na.omit(de_clean$Interaction$ENTREZID), readable = TRUE
+)
+go_int_tbl <- as.data.frame(go_int)
+readr::write_csv(go_int_tbl, "tables/go_bp_interaction_up.csv")
+```
+
+The `r nrow(int_up)` genes with a *stronger* HDM response in the knockout are enriched for inflammatory and interferon-driven host-defence processes (GO biological process). These include guanylate-binding proteins (*Gbp2*, *Gbp3*, *Gbp6*), *Stat1* and *Cd274* (PD-L1), alongside myeloid receptors.
+
+```{r}
+#| label: tbl-interaction-go
+#| tbl-cap: "Top GO biological processes among genes with a stronger HDM response in ALOX15 KO lungs (interaction FDR < 0.05, unflagged)."
+
+go_int_tbl %>%
+  dplyr::slice_min(p.adjust, n = 10, with_ties = FALSE) %>%
+  dplyr::transmute(Process = Description, Genes = GeneRatio, `Adj. P` = signif(p.adjust, 2),
+                   `Example genes` = purrr::map_chr(strsplit(geneID, "/"), ~ paste(head(.x, 8), collapse = ", "))) %>%
+  nice_table()
+```
+
+```{r}
+#| label: fig-interaction-heatmap
+#| fig-cap: "Unflagged genes with a significant genotype × HDM interaction (top 25 per direction by P value), shown as row z-scores of logCPM."
+#| fig-width: 8
+#| fig-height: 10
+
+int_genes <- dplyr::bind_rows(
+  de_clean$Interaction %>% dplyr::filter(FDR < fdr_cutoff, logFC > 0) %>% dplyr::slice_min(PValue, n = 25) %>%
+    dplyr::mutate(block = "Stronger HDM response in KO"),
+  de_clean$Interaction %>% dplyr::filter(FDR < fdr_cutoff, logFC < 0) %>% dplyr::slice_min(PValue, n = 25) %>%
+    dplyr::mutate(block = "Weaker HDM response in KO")
+) %>%
+  dplyr::select(SYMBOL, block)
+
+ht_int <- grouped_zscore_heatmap(logcpm, int_genes, samples, cluster_within = TRUE, row_fontsize = 8)
+draw_int <- function() ComplexHeatmap::draw(ht_int, merge_legends = TRUE)
+save_grid(draw_int, "interaction_heatmap.png", width = 8, height = 10)
+draw_int()
+```
+
+These genes, including *Emr1* (F4/80), *Fpr2*, *Mnda*, *Clec12a*, *Fcgr1* and *Aoah*, mark monocytes, macrophages and neutrophils, and the *Gbp* genes and *Stat1* point to stronger interferon-γ signalling. ALOX15 products include precursors of pro-resolving lipid mediators, so a larger myeloid infiltrate in knockout lungs is biologically plausible. There is one important reservation. The KO HDM group is also the group with the liver signal, so it may have been processed as a separate batch. Within that group, the interaction genes do not track the liver score, which argues against simple carry-over of liver macrophages (Kupffer cells). Even so, a batch effect affecting a whole group cannot be ruled out from this design.
+
+## Interpretation
+
+- **HDM dominates.** Allergen challenge changes thousands of genes. ALOX15 loss alone changes about 140 unflagged genes at baseline, and a large share of the consistent ones are passenger genes.
+- **The type 2 program does not need ALOX15.** Th2 chemokines, goblet-cell, mast-cell and macrophage genes respond in the same way in both genotypes ([Allergy gene panels](Gene-panels.qmd)).
+- **A possible gain in myeloid inflammation.** Knockout lungs show stronger induction of monocyte, neutrophil and interferon-inducible genes after HDM. This is a hypothesis to test: it needs confirmation by flow cytometry or in an independent cohort processed alongside wild-type controls.
+- **Lessons for the design.** Genotype comparisons here carry three hidden factors: a 129 congenic interval, a perfusion difference and a probable processing batch. Collecting and processing genotypes in balanced batches, and checking contamination markers before sequencing, would make the genotype questions far easier to answer.

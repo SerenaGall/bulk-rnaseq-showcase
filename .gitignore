@@ -1,0 +1,19 @@
+# Large data and regenerated intermediates
+data/
+tables/
+figures/
+*.rds
+
+# Quarto
+/.quarto/
+/_book/
+*_files/
+**/*.quarto_ipynb
+
+# R / OS
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store
+render_log*.txt
+.claude/

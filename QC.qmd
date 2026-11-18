@@ -1,0 +1,257 @@
+---
+title: "Quality control"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source("R/setup.R")
+```
+
+## Overview
+
+This chapter downloads the gene-level count matrix deposited with [GEO GSE226609](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE226609), attaches the sample annotation, and checks sequencing depth and library complexity before any filtering. The output is an edgeR `DGEList` object that the later chapters build on.
+
+## Data import
+
+The depositors quantified reads with RSEM, so the matrix contains *expected counts*. These can be fractional when reads map to several isoforms or genes. edgeR models counts with a negative binomial distribution and accepts non-integer values, but expected counts are rounded here so that every value is a valid count. This changes library sizes by less than 0.01%.
+
+```{r}
+#| label: download-geo
+
+if (!file.exists(geo_counts_file)) {
+  download.file(geo_counts_url, geo_counts_file, mode = "wb")
+}
+
+raw <- read.delim(gzfile(geo_counts_file), row.names = 1, check.names = FALSE)
+dim(raw)
+```
+
+The count columns carry the submitters' internal codes (`HDM-A1`, `HDM-B3`, …). The letter identifies the experimental group, as confirmed against the GEO sample titles. Samples are renamed to readable labels and ordered by group.
+
+```{r}
+#| label: sample-sheet
+
+samples <- tibble::tibble(geo_column = colnames(raw)) %>%
+  dplyr::mutate(
+    code      = substr(geo_column, 5, 5),
+    group     = factor(group_codes[code], levels = group_levels),
+    genotype  = factor(if_else(grepl("^WT", group), "WT", "ALOX15 KO"),
+                       levels = c("WT", "ALOX15 KO")),
+    treatment = factor(if_else(grepl("HDM", group), "HDM", "Saline"),
+                       levels = c("Saline", "HDM"))
+  ) %>%
+  dplyr::arrange(group, nchar(geo_column), geo_column) %>%
+  dplyr::group_by(group) %>%
+  dplyr::mutate(sample = paste0(group, "_", dplyr::row_number())) %>%
+  dplyr::ungroup()
+
+counts <- round(as.matrix(raw[, samples$geo_column]))
+colnames(counts) <- samples$sample
+```
+
+```{r}
+#| label: tbl-design
+#| tbl-cap: "Samples, experimental groups and the matching column in the GEO count file."
+
+samples %>%
+  dplyr::transmute(Sample = sample, Genotype = genotype, Challenge = treatment,
+                   `GEO column` = geo_column) %>%
+  nice_table()
+```
+
+## Gene annotation
+
+Genes are identified by symbol in the deposited file, using the UCSC gene set of the time. A few symbols are older names, for example *Clca3* for the goblet-cell gene now called *Clca1* (gob-5), and *Igj* for *Jchain*. Symbols are mapped to Entrez IDs and full gene names with `org.Mm.eg.db`, which also prepares the IDs needed for KEGG analysis later on. Symbols that do not match directly are looked up as aliases.
+
+```{r}
+#| label: annotation
+
+sym <- rownames(counts)
+
+entrez <- AnnotationDbi::mapIds(org.Mm.eg.db, sym, "ENTREZID", "SYMBOL",
+                                multiVals = "first")
+missing <- is.na(entrez)
+entrez[missing] <- AnnotationDbi::mapIds(org.Mm.eg.db, sym[missing], "ENTREZID",
+                                         "ALIAS", multiVals = "first")
+
+entrez <- vapply(entrez, function(x) if (is.null(x)) NA_character_ else as.character(x)[1], "")
+genename <- rep(NA_character_, length(entrez))
+genename[!is.na(entrez)] <- unname(AnnotationDbi::mapIds(
+  org.Mm.eg.db, entrez[!is.na(entrez)], "GENENAME", "ENTREZID", multiVals = "first"))
+
+annotation <- tibble::tibble(
+  SYMBOL   = sym,
+  ENTREZID = unname(entrez),
+  GENENAME = genename
+)
+
+y <- DGEList(
+  counts  = counts,
+  samples = samples %>% dplyr::select(-group) %>% tibble::column_to_rownames("sample"),
+  group   = samples$group,
+  genes   = as.data.frame(annotation)
+)
+
+saveRDS(y, "data/y.rds")
+saveRDS(annotation, "data/annotation.rds")
+```
+
+`r sum(!is.na(annotation$ENTREZID))` of `r nrow(annotation)` symbols (`r percent(mean(!is.na(annotation$ENTREZID)), 0.1)`) map to an Entrez ID. Most of the remainder are predicted genes and non-coding loci that would not be used in pathway analysis anyway.
+
+## Library size
+
+Library sizes range from `r round(min(y$samples$lib.size) / 1e6, 1)` to `r round(max(y$samples$lib.size) / 1e6, 1)` million assigned reads. The largest library is `r round(max(y$samples$lib.size) / min(y$samples$lib.size), 1)`-fold the smallest. This is well within what TMM normalisation handles, and no group is systematically shallower than the others.
+
+```{r}
+#| label: fig-libsize
+#| fig-cap: "Library size per sample before filtering and normalisation, coloured by experimental group."
+#| fig-width: 9
+#| fig-height: 4.5
+
+lib_df <- y$samples %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::mutate(sample = factor(sample, levels = colnames(y)))
+
+p_lib <- ggplot(lib_df, aes(sample, lib.size / 1e6, fill = group)) +
+  geom_col(width = 0.75, colour = "black", linewidth = 0.2) +
+  scale_fill_manual(values = group_colours, labels = group_labels, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Library size (million reads)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top")
+
+save_plot(p_lib, "QC_library_size.png", width = 9, height = 4.5)
+p_lib
+```
+
+## Library complexity
+
+Sequencing depth alone does not show whether a library is dominated by a few transcripts. Two complementary checks are shown: the number of genes detected per sample, and the share of reads taken by the 50 most abundant genes. A degraded or bottlenecked library would show fewer detected genes and a higher top-50 share.
+
+```{r}
+#| label: fig-complexity
+#| fig-cap: "Library complexity. (A) Genes with at least 10 reads per sample. (B) Percentage of each library taken up by its 50 most abundant genes."
+#| fig-width: 10
+#| fig-height: 4.5
+
+top50_share <- apply(y$counts, 2, function(x) sum(sort(x, decreasing = TRUE)[1:50]) / sum(x))
+
+cx <- lib_df %>%
+  dplyr::mutate(
+    detected = colSums(y$counts >= 10)[as.character(sample)],
+    top50    = top50_share[as.character(sample)]
+  )
+
+p_det <- ggplot(cx, aes(sample, detected, fill = group)) +
+  geom_col(width = 0.75, colour = "black", linewidth = 0.2) +
+  scale_fill_manual(values = group_colours, labels = group_labels, name = NULL) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Genes with ≥ 10 reads", tag = "A") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_top <- ggplot(cx, aes(sample, top50, fill = group)) +
+  geom_col(width = 0.75, colour = "black", linewidth = 0.2) +
+  scale_fill_manual(values = group_colours, labels = group_labels, name = NULL) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Reads in top 50 genes", tag = "B") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_cx <- (p_det + p_top) + plot_layout(guides = "collect") & theme(legend.position = "top")
+save_plot(p_cx, "QC_library_complexity.png", width = 10, height = 4.5)
+p_cx
+```
+
+Every library detects `r comma(min(cx$detected))`–`r comma(max(cx$detected))` genes, and the top 50 genes take `r percent(min(cx$top50), 1)`–`r percent(max(cx$top50), 1)` of reads. No library looks degraded or bottlenecked, so all `r ncol(y)` samples are kept.
+
+```{r}
+#| label: tbl-top-genes
+#| tbl-cap: "The ten most abundant genes across all libraries (mean counts per million)."
+
+tibble::tibble(
+  Gene = rownames(y),
+  Description = y$genes$GENENAME,
+  `Mean CPM` = rowMeans(cpm(y))
+) %>%
+  dplyr::slice_max(`Mean CPM`, n = 10) %>%
+  nice_table(digits = 0)
+```
+
+Apart from ribosomal RNA (*Rn45s*) and the nuclear non-coding RNA *Malat1*, which are abundant in most poly-A libraries, the top transcripts are lung products: the club cell secretoglobin *Scgb1a1*, surfactant protein C (*Sftpc*) and the macrophage lysozyme *Lyz2*.
+
+## Tissue contamination
+
+Whole-organ RNA-seq picks up any tissue that comes away with the organ at dissection, as well as the blood left in its vessels. For lung, the usual sources are chest-wall skeletal muscle, mediastinal brown fat around the heart and great vessels, liver tissue below the diaphragm, and residual blood. These signals can show up as "differentially expressed" genes, especially when they affect one group more than another.
+
+Each sample is scored for four tissues as the mean logCPM of ten highly specific markers per tissue (lists in `R/gene_panels.R`).
+
+```{r}
+#| label: contamination-scores
+
+logcpm_all <- cpm(y, log = TRUE, prior.count = 2)
+scores <- contamination_scores(logcpm_all)
+
+score_df <- as.data.frame(scores) %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::left_join(samples %>% dplyr::select(sample, group), by = "sample") %>%
+  tidyr::pivot_longer(-c(sample, group), names_to = "tissue", values_to = "score") %>%
+  dplyr::mutate(sample = factor(sample, levels = colnames(y)),
+                tissue = factor(tissue, levels = names(contamination_markers)))
+```
+
+```{r}
+#| label: fig-contamination
+#| fig-cap: "Per-sample tissue contamination scores (mean logCPM of ten marker genes). Higher values mean more transcripts from that tissue."
+#| fig-width: 10
+#| fig-height: 8
+
+p_cont <- ggplot(score_df, aes(sample, score, fill = group)) +
+  geom_col(width = 0.75, colour = "black", linewidth = 0.2) +
+  facet_wrap(~ tissue, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = group_colours, labels = group_labels, name = NULL) +
+  labs(x = NULL, y = "Marker score (mean logCPM)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top",
+        strip.background = element_blank(), strip.text = element_text(face = "bold", hjust = 0))
+
+save_plot(p_cont, "QC_tissue_contamination.png", width = 10, height = 8)
+p_cont
+```
+
+```{r}
+#| label: contamination-summary
+#| include: false
+
+sc <- as.data.frame(scores)
+sc$group <- samples$group[match(rownames(sc), samples$sample)]
+grp_mean <- aggregate(. ~ group, data = sc, FUN = mean)
+muscle_top <- rownames(sc)[order(-sc$`Skeletal muscle`)][1:2]
+```
+
+```{r}
+#| label: bat-summary
+#| include: false
+
+bat_high <- rownames(sc)[sc$`Brown fat (mediastinum)` > 3]
+```
+
+Four patterns stand out, and they need different responses:
+
+1. **Skeletal muscle in single samples.** `r muscle_top[1]` carries a large amount of skeletal muscle RNA, and `r muscle_top[2]` a smaller amount. All other lungs are clean.
+2. **Mediastinal brown fat in some samples.** `r length(bat_high)` lungs (`r paste(bat_high, collapse = ", ")`) contain brown adipose transcripts (*Ucp1*, *Cidea*, *Adipoq*), usually together with cardiac genes such as *Nppa*. This tissue sits around the heart and great vessels and comes away with the lung when the dissection is less clean. These samples span all four groups.
+
+   Neither of these two signals is tied to a group, so both can be **modelled as covariates**. Adding the two scores to the differential expression design removes the contaminating genes from every contrast without discarding samples. It also lowers the estimated biological variation between mice, which increases power (see [Differential expression](Statistical-analysis.qmd#dispersion-estimation)).
+3. **Liver transcripts in one whole group.** All five ALOX15 KO HDM lungs carry liver-specific mRNAs (albumin, fibrinogens, apolipoproteins) that are absent from the other 15 samples. A whole group affected at once points to a processing batch rather than individual dissections. It is **completely confounded** with the KO HDM group, so no model can separate it from biology. Liver-marker genes are flagged in every results table and excluded from interpretation.
+4. **Red blood cells by genotype.** Both knockout groups have about `r round(mean(grp_mean[grp_mean$group %in% c("KO_PBS","KO_HDM"), "Red blood cells"]) - mean(grp_mean[grp_mean$group %in% c("WT_PBS","WT_HDM"), "Red blood cells"]), 1)` log2 units more erythrocyte RNA than wild-type lungs. This most likely reflects how well the lungs were perfused when the two genotypes were collected. It is also **confounded with genotype**, and erythroid genes are flagged the same way.
+
+The primary comparison of this book, HDM against saline in wild-type mice, is affected only by the muscle and brown-fat signals, which the model absorbs. The genotype comparisons carry the two confounded signals, and the [ALOX15 chapter](Genotype-effects.qmd) interprets them with that in mind.
+
+```{r}
+#| label: save-scores
+#| include: false
+
+y$samples$muscle_score <- scores[colnames(y), "Skeletal muscle"] - median(scores[, "Skeletal muscle"])
+y$samples$bat_score    <- scores[colnames(y), "Brown fat (mediastinum)"] - median(scores[, "Brown fat (mediastinum)"])
+y$samples$liver_score  <- scores[colnames(y), "Liver"]
+y$samples$rbc_score    <- scores[colnames(y), "Red blood cells"]
+saveRDS(y, "data/y.rds")
+```

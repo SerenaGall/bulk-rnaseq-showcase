@@ -1,0 +1,202 @@
+---
+title: "Filtering and normalisation"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source("R/setup.R")
+```
+
+```{r}
+#| label: load
+#| include: false
+
+y <- readRDS("data/y.rds")
+```
+
+## Filtering lowly expressed genes
+
+Genes with too few reads to be tested reliably are removed before normalisation and modelling. This reduces noise in dispersion estimation and the multiple-testing burden. `filterByExpr()` keeps genes with a minimum count-per-million in at least as many samples as the smallest group (here five), with the CPM threshold derived from the median library size [@chen2016reads].
+
+```{r}
+#| label: filter
+
+keep <- filterByExpr(y, group = y$samples$group)
+y2 <- y[keep, , keep.lib.sizes = FALSE]
+```
+
+```{r}
+#| label: tbl-filtering
+#| tbl-cap: "Genes before and after expression filtering."
+
+tibble::tibble(
+  Stage = c("Before filtering", "After filterByExpr()"),
+  Genes = c(nrow(y), nrow(y2)),
+  `Share of reads kept` = c(1, sum(y2$counts) / sum(y$counts))
+) %>%
+  dplyr::mutate(Genes = comma(Genes), `Share of reads kept` = percent(`Share of reads kept`, 0.1)) %>%
+  nice_table()
+```
+
+About `r percent(nrow(y2) / nrow(y), 1)` of genes pass the filter, yet they carry `r percent(sum(y2$counts) / sum(y$counts), 0.1)` of all reads. The genes removed are almost all unexpressed in lung or detected only sporadically.
+
+## TMM normalisation
+
+Two technical effects must be removed before samples can be compared:
+
+- **Sequencing depth**: deeper libraries give proportionally more reads for every gene.
+- **RNA composition**: each library has a fixed number of reads, so a strongly induced set of genes "uses up" reads and makes everything else look lower. This matters here, because HDM challenge induces very high expression of a few genes such as *Chil4*, *Retnla* and the mucins.
+
+Trimmed mean of M-values (TMM) normalisation corrects both [@robinson2010tmm]. Normalisation factors are stored in the `DGEList` and used automatically when edgeR fits its models. For plots and heatmaps, expression is shown as log2 counts per million (logCPM) with the TMM factors applied.
+
+```{r}
+#| label: tmm
+
+y2 <- normLibSizes(y2, method = "TMM")
+logcpm <- cpm(y2, log = TRUE, prior.count = 2)
+
+saveRDS(y2, "data/y2.rds")
+saveRDS(logcpm, "data/logcpm.rds")
+```
+
+```{r}
+#| label: fig-tmm-factors
+#| fig-cap: "TMM normalisation factors by sample. Values below 1 mean the library is scaled down relative to its raw size, as expected when a few very abundant genes dominate it."
+#| fig-width: 9
+#| fig-height: 4
+
+nf <- y2$samples %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::mutate(sample = factor(sample, levels = colnames(y2)))
+
+p_nf <- ggplot(nf, aes(sample, norm.factors, colour = group)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_segment(aes(xend = sample, y = 1, yend = norm.factors), linewidth = 0.6) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = group_colours, labels = group_labels, name = NULL) +
+  labs(x = NULL, y = "TMM normalisation factor") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top")
+
+save_plot(p_nf, "tmm_factors.png", width = 9, height = 4)
+p_nf
+```
+
+TMM factors lie between `r round(min(nf$norm.factors), 2)` and `r round(max(nf$norm.factors), 2)`, and group means differ by less than `r ceiling(100 * diff(range(tapply(nf$norm.factors, nf$group, mean))))`%. The composition effect is therefore mild in this dataset. Even a strong local response such as HDM inflammation leaves the bulk of the lung transcriptome unchanged, which is exactly the assumption TMM relies on.
+
+## Expression distributions
+
+Density plots compare the distribution of expression values in each sample before and after normalisation. After TMM the curves overlap closely, so remaining differences between groups reflect biology rather than library size.
+
+```{r}
+#| label: fig-density
+#| fig-cap: "Per-sample expression densities before (log2 counts + 1, filtered genes) and after normalisation (TMM logCPM)."
+#| fig-width: 10
+#| fig-height: 4
+
+dens_df <- function(mat, value) {
+  as.data.frame(mat) %>%
+    tibble::rownames_to_column("gene") %>%
+    tidyr::pivot_longer(-gene, names_to = "sample", values_to = value) %>%
+    dplyr::left_join(nf %>% dplyr::select(sample, group), by = "sample")
+}
+
+q1 <- ggplot(dens_df(log2(y2$counts + 1), "v"), aes(v, colour = group, group = sample)) +
+  geom_density(linewidth = 0.4) +
+  scale_colour_manual(values = group_colours, labels = group_labels, name = NULL) +
+  labs(title = "Before normalisation", x = "log2(counts + 1)", y = "Density")
+
+q2 <- ggplot(dens_df(logcpm, "v"), aes(v, colour = group, group = sample)) +
+  geom_density(linewidth = 0.4) +
+  scale_colour_manual(values = group_colours, labels = group_labels, name = NULL) +
+  labs(title = "After TMM normalisation", x = "log2 CPM", y = "Density")
+
+p_dens <- (q1 + q2) + plot_layout(guides = "collect") & theme(legend.position = "top")
+save_plot(p_dens, "density_prepost.png", width = 10, height = 4)
+p_dens
+```
+
+## Sample structure
+
+### Multidimensional scaling
+
+Multidimensional scaling (MDS) places samples by the leading log-fold-change between each pair, using the 500 most variable genes. It is the standard edgeR view of whether samples group by biology.
+
+```{r}
+#| label: fig-mds
+#| fig-cap: "MDS plot of TMM-normalised expression. Colour shows experimental group, shape shows genotype. The first dimension separates HDM-challenged from saline lungs."
+#| fig-width: 7
+#| fig-height: 5.5
+
+mds <- plotMDS(y2, plot = FALSE)
+
+mds_df <- nf %>%
+  dplyr::mutate(dim1 = mds$x, dim2 = mds$y)
+
+p_mds <- ggplot(mds_df, aes(dim1, dim2, colour = group, shape = genotype)) +
+  geom_point(size = 3.5) +
+  ggrepel::geom_text_repel(aes(label = sample), size = 2.8, show.legend = FALSE,
+                           max.overlaps = Inf, seed = 1) +
+  scale_colour_manual(values = group_colours, labels = group_labels, name = "Group") +
+  scale_shape_manual(values = c(WT = 16, `ALOX15 KO` = 17), name = "Genotype") +
+  labs(
+    x = sprintf("Leading logFC dim 1 (%.0f%%)", 100 * mds$var.explained[1]),
+    y = sprintf("Leading logFC dim 2 (%.0f%%)", 100 * mds$var.explained[2])
+  )
+
+save_plot(p_mds, "norm_mds.png", width = 7, height = 5.5)
+p_mds
+```
+
+### Principal component analysis
+
+PCA on logCPM gives a variance-based view of the same structure. Colouring the first two components by library size and normalisation factor checks that neither technical variable drives the main axes of variation.
+
+```{r}
+#| label: fig-pca
+#| fig-cap: "PCA of TMM-normalised logCPM (500 most variable genes). Panels are coloured by (A) experimental group, (B) library size and (C) TMM factor."
+#| fig-width: 12
+#| fig-height: 4.5
+
+top_var <- names(sort(apply(logcpm, 1, var), decreasing = TRUE))[1:500]
+pc <- prcomp(t(logcpm[top_var, ]), center = TRUE, scale. = FALSE)
+var_pc <- 100 * pc$sdev^2 / sum(pc$sdev^2)
+
+pc_df <- nf %>%
+  dplyr::mutate(PC1 = pc$x[sample, 1], PC2 = pc$x[sample, 2])
+
+xlab <- sprintf("PC1 (%.1f%%)", var_pc[1])
+ylab <- sprintf("PC2 (%.1f%%)", var_pc[2])
+
+p_pc_group <- ggplot(pc_df, aes(PC1, PC2, colour = group, shape = genotype)) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = group_colours, labels = group_labels, name = NULL) +
+  scale_shape_manual(values = c(WT = 16, `ALOX15 KO` = 17), name = NULL) +
+  labs(x = xlab, y = ylab, tag = "A") +
+  guides(colour = guide_legend(ncol = 1), shape = guide_legend(ncol = 1))
+
+p_pc_lib <- ggplot(pc_df, aes(PC1, PC2, colour = lib.size / 1e6)) +
+  geom_point(size = 3) +
+  scale_colour_viridis_c(name = "Library\nsize (M)") +
+  labs(x = xlab, y = ylab, tag = "B")
+
+p_pc_nf <- ggplot(pc_df, aes(PC1, PC2, colour = norm.factors)) +
+  geom_point(size = 3) +
+  scale_colour_viridis_c(option = "magma", name = "TMM\nfactor") +
+  labs(x = xlab, y = ylab, tag = "C")
+
+p_pca <- p_pc_group + p_pc_lib + p_pc_nf
+save_plot(p_pca, "norm_pca.png", width = 12, height = 4.5)
+p_pca
+```
+
+```{r}
+#| label: pca-loadings
+#| include: false
+
+pc2_pos <- names(sort(pc$rotation[, 2], decreasing = TRUE))[1:8]
+pc2_neg <- names(sort(pc$rotation[, 2]))[1:8]
+```
+
+PC1 (`r round(var_pc[1])`% of variance) separates HDM-challenged from saline lungs in both genotypes, and its top-loading genes are the classic allergic markers (*Chil4*, *Clca3*, *Muc5ac*, *Rnase2a*). PC2 (`r round(var_pc[2])`%) is not biology. One end is driven by liver transcripts (*`r paste(head(pc2_pos[grepl("^Mup|^Alb|^Serpina|^Cps1|^Apo", pc2_pos)], 4), collapse = "*, *")`*), the other by brown fat and heart (*`r paste(head(pc2_neg, 5), collapse = "*, *")`*). These are the dissection signals described in the [QC chapter](QC.qmd#tissue-contamination), and they are why the contamination scores enter the statistical model. Neither library size nor TMM factor follows the main axes, and genotype has no axis of its own. This already suggests that the ALOX15 knockout changes the lung transcriptome much less than allergen challenge does.

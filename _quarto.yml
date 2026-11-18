@@ -1,0 +1,50 @@
+project:
+  type: book
+  output-dir: _book
+
+execute:
+  freeze: auto
+  echo: true
+  message: false
+  warning: false
+
+book:
+  title: "House dust mite allergic airway inflammation in the mouse lung"
+  subtitle: "A bulk RNA-seq analysis workflow with edgeR"
+  author: "Serena Gallozzi, PhD"
+  date: last-modified
+  repo-url: https://github.com/SerenaGall/bulk-rnaseq-showcase
+  repo-actions: [source, issue]
+  site-url: https://serenagall.github.io/bulk-rnaseq-showcase/
+  search: true
+  image: images/overview/volcano.png
+  open-graph: true
+  chapters:
+    - index.qmd
+    - part: "Data processing"
+      chapters:
+        - QC.qmd
+        - Filtering-Normalisation.qmd
+    - part: "Differential expression"
+      chapters:
+        - Statistical-analysis.qmd
+        - KEGG-pathway-analysis.qmd
+        - Gene-panels.qmd
+        - Genotype-effects.qmd
+    - references.qmd
+  appendices:
+    - Appendix.qmd
+
+bibliography: references.bib
+csl: nature.csl
+
+format:
+  html:
+    css: styles.css
+    theme: flatly
+    toc: true
+    code-fold: true
+    code-tools: true
+    fig-format: png
+    fig-dpi: 150
+    lightbox: auto

@@ -1,0 +1,39 @@
+# Reproducibility {#sec-reproducibility}
+
+```{r}
+#| label: setup
+#| include: false
+
+source("R/setup.R")
+```
+
+## Data provenance
+
+| Item | Value |
+|---|---|
+| Source | [GEO GSE226609](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE226609) |
+| File | `GSE226609_rsem_count.txt.gz` (RSEM expected counts, gene symbols) |
+| Organism / tissue | *Mus musculus*, C57BL/6 female, whole lung |
+| Library | Stranded poly-A mRNA, Illumina HiSeq 4000 |
+| Upstream processing (by depositors) | Bowtie2 v2.1.0 to the UCSC transcript set, RSEM v1.2.15 |
+| Groups | WT saline, WT HDM, ALOX15 KO saline, ALOX15 KO HDM (n = 5 each) |
+
+: Dataset used in this book {#tbl-provenance}
+
+## Outputs
+
+Each chapter writes its figures to `figures/` and its result tables to `tables/` when the book is rendered:
+
+- `tables/DE_<contrast>.csv`: full edgeR results for each of the five contrasts
+- `tables/kegg_ora_HDM_in_WT.csv`, `tables/kegg_gsea_HDM_in_WT.csv`: KEGG enrichment results
+- `tables/genes_by_mechanism.csv`: HDM-induced genes grouped into mechanism themes
+
+## Session information
+
+```{r}
+#| label: session-info
+#| code-fold: false
+
+sessioninfo_available <- requireNamespace("sessioninfo", quietly = TRUE)
+if (sessioninfo_available) sessioninfo::session_info(pkgs = "attached") else sessionInfo()
+```

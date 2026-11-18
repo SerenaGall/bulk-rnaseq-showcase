@@ -1,0 +1,81 @@
+# Overview {.unnumbered}
+
+::: {.lead}
+**House dust mite challenge rewires the mouse lung transcriptome towards type 2 inflammation, and the response does not need ALOX15.** This book is an end-to-end bulk RNA-seq analysis of public data ([GEO GSE226609](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE226609)). It goes from a raw count matrix through quality control, edgeR quasi-likelihood modelling, KEGG pathways, curated allergy panels and a 2 × 2 genotype × allergen design. It also shows how to catch and handle the dissection and batch artefacts that whole-tissue data often hide.
+:::
+
+::: {.stat-grid}
+::: {.stat}
+[20]{.stat-value}
+[whole lungs, 2 genotypes × 2 challenges, n = 5 per group]{.stat-label}
+:::
+::: {.stat}
+[5,093]{.stat-value}
+[genes changed by HDM in wild-type lung (FDR < 0.05)]{.stat-label}
+:::
+::: {.stat}
+[~650×]{.stat-value}
+[induction of the eosinophil ribonuclease *Rnase2a*; *Chil4* ~550×]{.stat-label}
+:::
+::: {.stat}
+[4]{.stat-value}
+[tissue contamination signals detected and handled]{.stat-label}
+:::
+:::
+
+## Key findings
+
+::: {layout="[[1,1],[1,1]]"}
+![**A strong type 2 response.** HDM changes over 5,000 genes in wild-type lung, led by eosinophil, mast cell, macrophage and goblet-cell genes. → [Differential expression](Statistical-analysis.qmd)](images/overview/volcano.png){#fig-overview-volcano}
+
+![**Curated allergy panels** recover the hallmarks of allergic airway disease: eotaxins, alternatively activated macrophages, goblet-cell metaplasia, mucosal mast cells and local antibody production. → [Allergy gene panels](Gene-panels.qmd)](images/overview/panel_heatmap.png){#fig-overview-panels}
+
+![**Contamination, caught in QC.** Skeletal muscle and brown fat in single lungs are modelled as covariates. Liver and blood signals tied to the knockout groups are flagged. → [Quality control](QC.qmd#tissue-contamination)](images/overview/contamination.png){#fig-overview-contamination}
+
+::: {.findings-box}
+**ALOX15 knockout and pathways**
+
+- **The allergic response is preserved.** HDM fold changes in knockout and wild-type lungs correlate at r = 0.86, with a slope close to 1. → [ALOX15 knockout](Genotype-effects.qmd)
+- **Passenger genes.** 21 of 48 genes that differ by genotype in every condition sit on chromosome 11 around *Alox15*: the footprint of a 129-derived congenic interval.
+- **A hypothesis.** Knockout lungs show stronger induction of monocyte, neutrophil and interferon-inducible genes after HDM. This is confounded with a probable processing batch, so it is flagged as a lead rather than a result.
+- **Pathways.** HDM-induced genes are enriched for cytokine–receptor signalling, complement, neutrophil extracellular traps and cell proliferation; repressed genes for club-cell xenobiotic metabolism. → [KEGG pathways](KEGG-pathway-analysis.qmd)
+:::
+:::
+
+## Dataset
+
+Female C57BL/6 mice, wild type or ALOX15 knockout, were challenged intranasally with house dust mite (HDM) extract or saline daily for 14 days. Lungs were snap-frozen and homogenised, and total RNA was extracted with TRIzol and purified on RNeasy columns. Stranded poly-A mRNA libraries were sequenced on an Illumina HiSeq 4000. The depositors aligned reads with Bowtie2 to the UCSC transcript set and quantified gene-level expected counts with RSEM [@li2011rsem]. This book starts from that count matrix.
+
+| Group | Genotype | Challenge | Mice | GEO column codes |
+|---|---|---|---|---|
+| WT_PBS | Wild type | Saline | 5 | HDM-A1 – A5 |
+| WT_HDM | Wild type | House dust mite | 5 | HDM-B3, B4, B5, B8, B10 |
+| KO_PBS | ALOX15 KO | Saline | 5 | HDM-C1 – C5 |
+| KO_HDM | ALOX15 KO | House dust mite | 5 | HDM-D4, D6, D8, D9, D10 |
+
+: Study design {#tbl-design}
+
+The **primary question** is the HDM response in wild-type lung, a two-group treatment-vs-control comparison. The knockout arm adds a factorial layer: does losing ALOX15 change the lung at baseline, or change the size of the allergic response?
+
+## Workflow
+
+| Chapter | Main methods |
+|---|---|
+| [Quality control](QC.qmd) | GEO import, gene annotation, library size and complexity, tissue contamination scores |
+| [Filtering and normalisation](Filtering-Normalisation.qmd) | `filterByExpr`, TMM, density plots, MDS, PCA with loading checks |
+| [Differential expression](Statistical-analysis.qmd) | Sample correlation, factorial GLM with contamination covariates, edgeR quasi-likelihood F-tests, volcano/MA plots, heatmaps |
+| [KEGG pathway analysis](KEGG-pathway-analysis.qmd) | Directional ORA, GSEA on signed significance, gene–pathway networks, mechanism themes |
+| [Allergy gene panels](Gene-panels.qmd) | Curated type 2 panels, grouped heatmaps, genotype-comparative dot plots |
+| [ALOX15 knockout](Genotype-effects.qmd) | Knockout validation, confounder flagging, passenger-gene mapping, interaction analysis, GO enrichment |
+
+Code is folded under each figure: click **Code** to expand it. Full result tables are written to `tables/` on render.
+
+## Reproducing the analysis
+
+```bash
+git clone https://github.com/SerenaGall/bulk-rnaseq-showcase
+cd bulk-rnaseq-showcase
+quarto render
+```
+
+Requires R (≥ 4.4) with edgeR, clusterProfiler, org.Mm.eg.db, ComplexHeatmap and the tidyverse, plus Quarto. The first chapter downloads the GEO count file (~1 MB) into `data/raw/`. KEGG enrichment queries the KEGG REST service, so the first render needs internet access. Computed results are stored in `_freeze/`, so the website can be rebuilt without re-running R.

@@ -1,0 +1,58 @@
+p {
+  text-align: justify;
+}
+
+/* Overview page ------------------------------------------------------------ */
+.lead {
+  font-size: 1.15rem;
+  text-align: left;
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.75rem;
+  margin: 1.5rem 0 2rem;
+}
+
+.stat {
+  border: 1px solid #dee2e6;
+  border-radius: 8px;
+  padding: 0.9rem 1rem;
+  background: #f8f9fa;
+}
+
+.stat p {
+  margin: 0;
+  text-align: left;
+}
+
+.stat-value {
+  display: block;
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: #00838F;
+  line-height: 1.2;
+}
+
+.stat-label {
+  display: block;
+  font-size: 0.85rem;
+  color: #495057;
+}
+
+.findings-box {
+  border-left: 4px solid #00838F;
+  padding: 0.5rem 1rem;
+  background: #f8f9fa;
+  font-size: 0.92rem;
+}
+
+.findings-box p,
+.findings-box li {
+  text-align: left;
+}
+
+.lead strong {
+  font-weight: 700;
+}

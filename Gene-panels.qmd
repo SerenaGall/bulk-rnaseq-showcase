@@ -1,0 +1,131 @@
+---
+title: "Allergy gene panels"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source("R/setup.R")
+```
+
+```{r}
+#| label: load
+#| include: false
+
+de <- readRDS("data/de_results.rds")
+logcpm <- readRDS("data/logcpm.rds")
+y2 <- readRDS("data/y2.rds")
+samples <- y2$samples %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::mutate(group = factor(group, levels = group_levels))
+
+res <- de$HDM_in_WT
+```
+
+## Overview
+
+Genome-wide tests are complemented here by targeted gene panels: short, curated lists of genes with well-known roles in type 2 allergic airway inflammation. Panels make it easy to read a result against prior biology, for example whether the HDM model reproduces Th2 cytokines, eosinophilia, mast cell activation, goblet cell metaplasia and alternative macrophage activation. They also give figures that can go straight into a manuscript.
+
+The panels are defined in `R/gene_panels.R`. Genes that did not pass expression filtering in lung are dropped. This mostly affects T-cell cytokines such as *Il4* and *Il5*, which are produced by rare cells and are hard to detect in whole-tissue RNA.
+
+```{r}
+#| label: tbl-panels
+#| tbl-cap: "Curated panels, with the number of genes detected in lung and the number changed by HDM in WT mice (FDR < 0.05)."
+
+panel_res <- allergy_panel_tbl %>%
+  dplyr::left_join(res %>% dplyr::select(SYMBOL, logFC, FDR, status), by = "SYMBOL")
+
+panel_res %>%
+  dplyr::group_by(Panel = block) %>%
+  dplyr::summarise(
+    `In panel` = dplyr::n(),
+    Detected = sum(!is.na(FDR)),
+    Up = sum(status == "Up", na.rm = TRUE),
+    Down = sum(status == "Down", na.rm = TRUE),
+    `Not detected` = paste(SYMBOL[is.na(FDR)], collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  nice_table()
+```
+
+## Panel heatmap
+
+```{r}
+#| label: fig-panel-heatmap
+#| fig-cap: "Allergy panel genes changed by HDM in WT lung (FDR < 0.05), shown as row z-scores of logCPM across all four groups. Within each panel, genes are ordered by fold change."
+#| fig-width: 8
+#| fig-height: 13
+
+panel_sig <- panel_res %>%
+  dplyr::filter(!is.na(FDR), FDR < fdr_cutoff) %>%
+  dplyr::arrange(block, dplyr::desc(logFC)) %>%
+  dplyr::distinct(SYMBOL, .keep_all = TRUE) %>%
+  dplyr::transmute(SYMBOL, block = as.character(block))
+
+ht_panel <- grouped_zscore_heatmap(logcpm, panel_sig, samples, row_fontsize = 8)
+draw_panel <- function() ComplexHeatmap::draw(ht_panel, merge_legends = TRUE)
+save_grid(draw_panel, "allergy_panel_heatmap.png", width = 8, height = 13)
+draw_panel()
+```
+
+The panels read like a textbook description of HDM-induced type 2 inflammation:
+
+- **Recruitment.** The eotaxins *Ccl11* and *Ccl24*, along with *Ccl8*, *Ccl17* and their receptor *Ccr3*, rise 4- to 15-fold. Recruitment is reflected in the eosinophil granule genes *Prg2* and *Ear6*.
+- **Alternatively activated macrophages.** *Chil4*, *Arg1*, *Retnla* and *Chil3* are among the most strongly induced genes in the dataset.
+- **Goblet cell metaplasia.** *Muc5ac*, *Clca3* (gob-5), *Itln1*, *Slc26a4* (pendrin), *Tff2*, *Agr2* and the goblet-cell transcription factors *Foxa3* and *Spdef* all rise.
+- **Mast cells and B cells.** Mucosal mast cell proteases *Mcpt1* and *Mcpt2* rise more than 100-fold, while connective-tissue mast cell genes (*Cpa3*, *Cma1*, *Tpsb2*) do not change. The plasma-cell and germinal-centre genes *Igj*, *Mzb1*, *Tnfrsf17* (BCMA) and *Aicda* point to local antibody production.
+- **Alarmins.** *Il33* and its receptor *Il1rl1* (ST2) are induced, and *Il10* rises as part of the regulatory response.
+
+T-cell cytokines (*Il4*, *Il5*, *Il13*) and lineage transcription factors (*Gata3*, *Foxp3*, *Tbx21*) are mostly not detected or unchanged. Their cells are too rare for whole-lung RNA, which is why bulk lung profiles are best read through the downstream effector genes above.
+
+## Effect sizes by panel and genotype
+
+The heatmap shows within-gene patterns. The dot plot below compares effect sizes directly, side by side for the HDM response in wild-type and ALOX15 knockout lungs. Dots are shown for genes significant in at least one genotype.
+
+```{r}
+#| label: fig-panel-dotplot
+#| fig-cap: "HDM response of allergy panel genes in WT and ALOX15 KO lungs. Colour is log2 fold change (HDM vs saline within genotype); dot size is −log10 FDR; open circles are not significant (FDR ≥ 0.05)."
+#| fig-width: 7
+#| fig-height: 16
+
+dot_df <- dplyr::bind_rows(
+  WT = de$HDM_in_WT, `ALOX15 KO` = de$HDM_in_KO, .id = "genotype"
+) %>%
+  dplyr::inner_join(allergy_panel_tbl, by = "SYMBOL", relationship = "many-to-many") %>%
+  dplyr::group_by(SYMBOL, block) %>%
+  dplyr::filter(any(FDR < fdr_cutoff)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    genotype = factor(genotype, levels = c("WT", "ALOX15 KO")),
+    sig = FDR < fdr_cutoff,
+    nlog = pmin(-log10(FDR), 20)
+  )
+
+gene_order <- dot_df %>%
+  dplyr::filter(genotype == "WT") %>%
+  dplyr::arrange(block, logFC) %>%
+  dplyr::pull(SYMBOL) %>% unique()
+
+p_dot <- ggplot(dot_df, aes(genotype, factor(SYMBOL, levels = unique(gene_order)))) +
+  geom_point(aes(size = nlog, colour = logFC, shape = sig), stroke = 0.8) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1), guide = "none") +
+  scale_size_continuous(range = c(1, 5), name = "−log10 FDR\n(capped at 20)") +
+  scale_colour_gradient2(low = "#2166AC", mid = "grey85", high = "#B2182B",
+                         midpoint = 0, limits = c(-6, 6), oob = squish, name = "log2FC") +
+  facet_grid(block ~ ., scales = "free_y", space = "free_y",
+             labeller = labeller(block = label_wrap_gen(18))) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.y = element_text(face = "italic"),
+    strip.text.y = element_text(angle = 0, face = "bold", hjust = 0),
+    strip.background = element_rect(fill = "grey95"),
+    panel.spacing.y = unit(3, "pt")
+  )
+
+save_plot(p_dot, "allergy_panel_dotplot.png", width = 7, height = 16)
+p_dot
+```
+
+The two genotypes give almost the same picture. Nearly every panel gene changes with the same sign and a similar magnitude in ALOX15-deficient lungs. This agrees with the small interaction contrast in the [differential expression chapter](Statistical-analysis.qmd) and is followed up in the [next chapter](Genotype-effects.qmd).

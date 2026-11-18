@@ -1,0 +1,266 @@
+---
+title: "Differential expression"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source("R/setup.R")
+```
+
+```{r}
+#| label: load
+#| include: false
+
+y2 <- readRDS("data/y2.rds")
+logcpm <- readRDS("data/logcpm.rds")
+annotation <- readRDS("data/annotation.rds")
+
+samples <- y2$samples %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::mutate(group = factor(group, levels = group_levels))
+```
+
+## Sample correlation
+
+Before modelling, pairwise Spearman correlation between samples checks for outliers and confirms that replicates resemble each other more than they resemble other groups. Clustering uses 1 − correlation as the distance with average linkage.
+
+```{r}
+#| label: fig-dendrogram
+#| fig-cap: "Hierarchical clustering of samples on Spearman correlation of TMM logCPM. Labels are coloured by experimental group."
+#| fig-width: 7
+#| fig-height: 5.5
+
+sample_hc <- hclust(as.dist(1 - cor(logcpm, method = "spearman")), method = "average")
+dend <- as.dendrogram(sample_hc)
+labels_colors(dend) <- group_colours[as.character(samples$group[match(labels(dend), samples$sample)])]
+dend <- dend %>% set("labels_cex", 0.8) %>% set("branches_lwd", 1.1)
+
+draw_dend <- function() {
+  par(mar = c(4, 1, 2, 9))
+  plot(dend, horiz = TRUE, xlab = "1 − Spearman correlation", main = "Sample clustering")
+  legend("topleft", legend = group_labels, text.col = group_colours, bty = "n", cex = 0.8)
+}
+save_grid(draw_dend, "sample_clustering_dendrogram.png", width = 7, height = 5.5)
+draw_dend()
+```
+
+The tree splits first by allergen challenge: all ten HDM lungs fall on one branch and all ten saline lungs on the other. Within the HDM branch, the knockout lungs form their own cluster. The exception is KO_HDM_5, which joins WT_HDM_2 and WT_HDM_4: these are the three HDM lungs with the most mediastinal brown fat (see the [QC chapter](QC.qmd#tissue-contamination)). Within the saline branch, genotypes are mixed.
+
+## Model and contrasts
+
+The experiment is a 2 × 2 factorial design (genotype × challenge, five mice per group). A single generalised linear model (GLM) with one coefficient per group is fitted to all 20 samples. Each question is then a contrast between group means. Fitting all samples together gives a better dispersion estimate than fitting each pairwise comparison alone.
+
+The model also includes two per-sample contamination scores from the [QC chapter](QC.qmd#tissue-contamination) as continuous covariates: **skeletal muscle** and **mediastinal brown fat**. Each costs one residual degree of freedom (14 remain). Without them, sarcomere genes such as *Acta1*, *Myh1* and *Pvalb* rank among the top "HDM-induced" genes, because the most contaminated sample happens to be in the WT HDM group. The brown-fat signal, carried by a different subset of lungs, also inflates the dispersion of thousands of genes.
+
+```{r}
+#| label: design
+
+design <- model.matrix(~ 0 + group + muscle_score + bat_score, data = samples)
+colnames(design) <- c(levels(samples$group), "muscle_score", "bat_score")
+rownames(design) <- samples$sample
+
+contrasts <- makeContrasts(
+  HDM_in_WT   = WT_HDM - WT_PBS,
+  HDM_in_KO   = KO_HDM - KO_PBS,
+  KO_baseline = KO_PBS - WT_PBS,
+  KO_with_HDM = KO_HDM - WT_HDM,
+  Interaction = (KO_HDM - KO_PBS) - (WT_HDM - WT_PBS),
+  levels = design
+)
+```
+
+```{r}
+#| label: tbl-contrasts
+#| tbl-cap: "Contrasts tested. The primary question of this chapter is the HDM response in wild-type lungs; the genotype contrasts are covered in the ALOX15 chapter."
+
+tibble::tibble(
+  Contrast = colnames(contrasts),
+  Definition = c("WT_HDM − WT_PBS", "KO_HDM − KO_PBS", "KO_PBS − WT_PBS",
+                 "KO_HDM − WT_HDM", "(KO_HDM − KO_PBS) − (WT_HDM − WT_PBS)"),
+  Question = c(
+    "How does HDM challenge change the wild-type lung? (primary)",
+    "How does HDM challenge change the ALOX15-deficient lung?",
+    "Does ALOX15 loss change the lung at baseline?",
+    "Does ALOX15 loss change the lung after HDM?",
+    "Does ALOX15 loss change the size of the HDM response?"
+  )
+) %>%
+  nice_table()
+```
+
+## Dispersion estimation
+
+Negative binomial dispersions describe how much counts vary between biological replicates beyond Poisson sampling noise. They are estimated with `estimateDisp()` and summarised as the biological coefficient of variation (BCV), the square root of the dispersion [@mccarthy2012glm].
+
+```{r}
+#| label: dispersion
+
+y2 <- estimateDisp(y2, design, robust = TRUE)
+```
+
+The common BCV is **`r round(sqrt(y2$common.dispersion), 3)`**, so typical gene-level variation between mice in the same group is about `r round(100 * sqrt(y2$common.dispersion))`%. This is in the usual range for inbred mice housed together, and low enough to give good power with five mice per group.
+
+```{r}
+#| label: fig-bcv
+#| fig-cap: "Biological coefficient of variation against average expression. Points are gene-wise estimates; lines show the common and trended dispersion used to shrink them."
+#| fig-width: 6
+#| fig-height: 5
+
+draw_bcv <- function() plotBCV(y2)
+save_grid(draw_bcv, "bcv_plot.png", width = 6, height = 5)
+draw_bcv()
+```
+
+## Quasi-likelihood testing
+
+Differential expression is tested with the edgeR quasi-likelihood (QL) F-test [@lun2016ql; @chen2025edger4]. QL methods add a gene-specific variability term on top of the negative binomial model and keep the false discovery rate under control better than likelihood-ratio tests at small sample sizes.
+
+```{r}
+#| label: qlfit
+
+fit <- glmQLFit(y2, design, robust = TRUE)
+
+de <- purrr::map(colnames(contrasts), function(ct) {
+  tidy_toptags(glmQLFTest(fit, contrast = contrasts[, ct]))
+}) %>%
+  purrr::set_names(colnames(contrasts))
+
+saveRDS(fit, "data/qlfit.rds")
+saveRDS(de, "data/de_results.rds")
+saveRDS(contrasts, "data/contrasts.rds")
+
+for (ct in names(de)) {
+  readr::write_csv(de[[ct]], file.path("tables", paste0("DE_", ct, ".csv")))
+}
+```
+
+```{r}
+#| label: fig-qldisp
+#| fig-cap: "Quasi-likelihood dispersions after empirical Bayes shrinkage towards the trend. Robust estimation keeps outlier genes from inflating the prior."
+#| fig-width: 6
+#| fig-height: 5
+
+draw_ql <- function() plotQLDisp(fit)
+save_grid(draw_ql, "ql_dispersion.png", width = 6, height = 5)
+draw_ql()
+```
+
+### Summary of all contrasts
+
+```{r}
+#| label: tbl-de-summary
+#| tbl-cap: "Number of differentially expressed genes per contrast (FDR < 0.05), overall and with at least a two-fold change."
+
+purrr::imap(de, de_counts) %>%
+  dplyr::bind_rows() %>%
+  nice_table()
+```
+
+HDM challenge changes the expression of thousands of genes in both genotypes. ALOX15 loss alone changes far fewer, and the interaction contrast is small. The rest of this chapter focuses on the wild-type HDM response.
+
+## The HDM response in wild-type lung
+
+```{r}
+#| label: primary
+
+res <- de$HDM_in_WT
+n_up   <- sum(res$status == "Up")
+n_down <- sum(res$status == "Down")
+n_up2   <- sum(res$status == "Up" & res$logFC >= lfc_cutoff)
+n_down2 <- sum(res$status == "Down" & res$logFC <= -lfc_cutoff)
+```
+
+Of the `r comma(nrow(res))` genes tested, **`r comma(n_up)` are upregulated and `r comma(n_down)` downregulated** in HDM-challenged wild-type lungs (FDR < 0.05). Of these, `r comma(n_up2)` up and `r comma(n_down2)` down change at least two-fold. The response is strongly skewed towards induction among the large changes, as expected for an inflammatory infiltrate entering the tissue.
+
+```{r}
+#| label: tbl-top-up
+#| tbl-cap: "Top 15 upregulated genes (at least two-fold) in WT lungs after HDM challenge, ranked by P value."
+
+res %>%
+  dplyr::filter(status == "Up", logFC >= lfc_cutoff) %>%
+  dplyr::slice_min(PValue, n = 15) %>%
+  dplyr::transmute(Gene = SYMBOL, Description = GENENAME, logFC, logCPM,
+                   FDR = signif(FDR, 2)) %>%
+  nice_table(digits = 2)
+```
+
+Tables are ranked by P value rather than fold change. Ranking by fold change rewards genes that are silent in one group and detected in a single mouse of the other. *Glycam1* is an example here: a high-endothelial-venule gene that is abundant only in the few lungs that carried a piece of lymph node (WT_PBS_4 and KO_PBS_4 most of all). With the covariates in the model, it gets a meaningless log2FC of about −20.
+
+```{r}
+#| label: tbl-top-down
+#| tbl-cap: "Top 15 downregulated genes (at least two-fold) in WT lungs after HDM challenge, ranked by P value."
+
+res %>%
+  dplyr::filter(status == "Down", logFC <= -lfc_cutoff) %>%
+  dplyr::slice_min(PValue, n = 15) %>%
+  dplyr::transmute(Gene = SYMBOL, Description = GENENAME, logFC, logCPM,
+                   FDR = signif(FDR, 2)) %>%
+  nice_table(digits = 2)
+```
+
+### Volcano plot
+
+```{r}
+#| label: fig-volcano
+#| fig-cap: "Volcano plot of the HDM response in wild-type lung. Dashed lines mark a two-fold change; fold changes beyond ±10 are drawn at the edge. The 12 most significant up- and downregulated genes are labelled."
+#| fig-width: 8
+#| fig-height: 6.5
+
+p_volcano <- plot_volcano(res, n_label = 12,
+                          title = "WT lung: HDM vs saline")
+save_plot(p_volcano, "volcano_HDM_in_WT.png", width = 8, height = 6.5)
+save_plot(p_volcano, "../images/overview/volcano.png", width = 8, height = 6.5, dpi = 150)
+p_volcano
+```
+
+### MA plots
+
+MA plots show fold change against average expression. They make it easier to see whether large fold changes come from abundant transcripts or from genes rising from near zero. In the first plot the strongest changes by fold change are labelled. In the second, the 20 most abundant genes are labelled, to check that the highly expressed structural and surfactant genes are not driving the result.
+
+```{r}
+#| label: fig-ma
+#| fig-cap: "MA plots of the HDM response in wild-type lung. (A) Top 10 up- and downregulated genes by fold change. (B) The 20 most abundant genes."
+#| fig-width: 12
+#| fig-height: 5
+
+top_fc <- c(
+  res %>% dplyr::filter(status == "Up")   %>% dplyr::slice_max(logFC, n = 10) %>% dplyr::pull(SYMBOL),
+  res %>% dplyr::filter(status == "Down") %>% dplyr::slice_min(logFC, n = 10) %>% dplyr::pull(SYMBOL)
+)
+top_abundant <- res %>% dplyr::slice_max(logCPM, n = 20) %>% dplyr::pull(SYMBOL)
+
+p_ma <- (plot_ma(res, top_fc) + labs(tag = "A")) +
+  (plot_ma(res, top_abundant) + labs(tag = "B")) +
+  plot_layout(guides = "collect") & theme(legend.position = "top")
+
+save_plot(p_ma, "ma_plots_HDM_in_WT.png", width = 12, height = 5)
+p_ma
+```
+
+The largest fold changes come from genes that are close to silent in saline lungs, such as the eosinophil ribonuclease *Rnase2a*, the chitinase-like protein *Chil4*, the mast cell proteases *Mcpt1* and *Mcpt2*, and the mucin-associated *Itln1* and *Clca3*. Most of the abundant lung genes in panel B sit near zero, so the result is not an artefact of a few dominant transcripts.
+
+### Heatmap of top DE genes
+
+```{r}
+#| label: fig-top-heatmap
+#| fig-cap: "Row-scaled expression (z-score of logCPM) of the 25 most significant up- and 25 most significant downregulated genes (FDR < 0.05, ≥ 2-fold) in the WT HDM contrast, shown across all four groups."
+#| fig-width: 8
+#| fig-height: 10
+
+top_genes <- dplyr::bind_rows(
+  res %>% dplyr::filter(status == "Up",   logFC >=  lfc_cutoff) %>% dplyr::slice_min(PValue, n = 25) %>% dplyr::mutate(block = "Up with HDM"),
+  res %>% dplyr::filter(status == "Down", logFC <= -lfc_cutoff) %>% dplyr::slice_min(PValue, n = 25) %>% dplyr::mutate(block = "Down with HDM")
+) %>%
+  dplyr::select(SYMBOL, block)
+
+ht_top <- grouped_zscore_heatmap(logcpm, top_genes, samples,
+                                 cluster_within = TRUE, row_fontsize = 8)
+
+draw_top <- function() ComplexHeatmap::draw(ht_top, merge_legends = TRUE)
+save_grid(draw_top, "top50_deg_heatmap.png", width = 8, height = 10)
+draw_top()
+```
+
+The selected genes are defined only from the wild-type contrast, yet the ALOX15 knockout groups follow the same pattern. The core HDM response is preserved without ALOX15. The [ALOX15 chapter](Genotype-effects.qmd) tests whether its size changes.

@@ -1,0 +1,276 @@
+---
+title: "KEGG pathway analysis"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+source("R/setup.R")
+```
+
+```{r}
+#| label: load
+#| include: false
+
+de <- readRDS("data/de_results.rds")
+logcpm <- readRDS("data/logcpm.rds")
+y2 <- readRDS("data/y2.rds")
+samples <- y2$samples %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::mutate(group = factor(group, levels = group_levels))
+
+res <- de$HDM_in_WT
+```
+
+## Overview
+
+Pathway analysis places the wild-type HDM response in the context of curated KEGG pathways [@kanehisa2000kegg]. Two complementary approaches are used [@wu2021clusterprofiler]:
+
+- **Over-representation analysis (ORA)** asks whether strongly changed genes (FDR < 0.05 and at least two-fold) fall in a pathway more often than chance. Up- and downregulated genes are tested separately, so that a pathway's direction is clear.
+- **Gene set enrichment analysis (GSEA)** uses every tested gene, ranked by signed significance, and asks whether a pathway's genes cluster at the top or bottom of the ranking [@subramanian2005gsea]. It needs no cut-off and picks up coordinated modest shifts.
+
+In both, the background is the set of genes that passed expression filtering, not the whole genome. Using the whole genome would inflate enrichment for any lung-expressed pathway.
+
+```{r}
+#| label: kegg-inputs
+
+res_kegg <- res %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(ENTREZID, .keep_all = TRUE)
+
+universe_ids <- res_kegg$ENTREZID
+up_ids   <- res_kegg %>% dplyr::filter(FDR < fdr_cutoff, logFC >=  lfc_cutoff) %>% dplyr::pull(ENTREZID)
+down_ids <- res_kegg %>% dplyr::filter(FDR < fdr_cutoff, logFC <= -lfc_cutoff) %>% dplyr::pull(ENTREZID)
+
+# Signed -log10(P) ranks genes by evidence and direction together, which is
+# more stable than ranking by fold change alone for lowly expressed genes.
+rank_stat <- with(res_kegg, sign(logFC) * -log10(PValue))
+gene_list <- sort(setNames(rank_stat, res_kegg$ENTREZID), decreasing = TRUE)
+```
+
+The ORA input is `r length(up_ids)` upregulated and `r length(down_ids)` downregulated genes, against a background of `r comma(length(universe_ids))` genes with an Entrez ID.
+
+## Over-representation analysis
+
+```{r}
+#| label: kegg-ora
+
+ora <- clusterProfiler::compareCluster(
+  geneClusters  = list(Up = up_ids, Down = down_ids),
+  fun           = "enrichKEGG",
+  organism      = "mmu",
+  universe      = universe_ids,
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH"
+)
+ora <- clusterProfiler::setReadable(ora, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+
+# Strip the species suffix KEGG appends to every pathway name
+ora@compareClusterResult$Description <- sub(" - Mus musculus.*$", "", ora@compareClusterResult$Description)
+
+ora_tbl <- as.data.frame(ora) %>% dplyr::filter(p.adjust < 0.05)
+readr::write_csv(ora_tbl, "tables/kegg_ora_HDM_in_WT.csv")
+```
+
+`r sum(ora_tbl$Cluster == "Up")` KEGG pathways are enriched among HDM-induced genes and `r sum(ora_tbl$Cluster == "Down")` among HDM-repressed genes (adjusted P < 0.05).
+
+```{r}
+#| label: fig-kegg-ora
+#| fig-cap: "KEGG pathways over-represented among genes up- or downregulated by HDM in WT lung (top 15 per direction). Dot size is the fraction of input genes in the pathway; colour is the adjusted P value."
+#| fig-width: 9
+#| fig-height: 9
+
+p_ora <- enrichplot::dotplot(ora, showCategory = 15, label_format = 45) +
+  labs(x = NULL) +
+  theme(axis.text.y = element_text(size = 9))
+
+save_plot(p_ora, "kegg_ora_dotplot.png", width = 9, height = 9)
+p_ora
+```
+
+```{r}
+#| label: tbl-kegg-ora
+#| tbl-cap: "Top enriched KEGG pathways per direction, with the leading genes from the input list."
+
+ora_tbl %>%
+  dplyr::group_by(Cluster) %>%
+  dplyr::slice_min(p.adjust, n = 10, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(
+    Direction = Cluster, Pathway = Description, Genes = GeneRatio,
+    `Adj. P` = signif(p.adjust, 2),
+    `Example genes` = purrr::map_chr(strsplit(geneID, "/"), ~ paste(head(.x, 8), collapse = ", "))
+  ) %>%
+  nice_table()
+```
+
+HDM-induced genes fall into three groups of pathways. The KEGG *Asthma*, *IL-17 signalling* and *Chemokine signalling* pathways are also enriched, though they rank lower because they are small or overlap with the larger terms.
+
+- **Leukocyte recruitment.** Cytokine–cytokine receptor interaction and viral protein interaction with cytokines are driven by the chemokines *Ccl6*, *Ccl8*, *Ccl9*, *Ccl11* (eotaxin), *Ccl20* and *Cxcl3* and their receptors *Ccr1*, *Ccr3* and *Ccr5*, together with *Il21* and *Csf2* (GM-CSF).
+- **Complement and innate effector functions.** Complement and coagulation cascades, neutrophil extracellular trap formation and *Staphylococcus aureus* infection all rest on *C3*, *C3ar1*, *C1q* genes, Fc-γ receptors and *Itgb2*.
+- **Cell proliferation.** Homologous recombination and the histone-rich pathways (*Systemic lupus erythematosus*, *Alcoholism*) pick up replication genes (*Rad51*, *Chek1*, *Cdk1*) and replication-dependent histones, a sign of the immune cells proliferating in the inflamed lung.
+
+The repressed set is smaller. It points to xenobiotic and glutathione metabolism (*Gstm1*, *Gsta3*, *Cyp2f2*, the cytochrome P450 enzymes of club cells), neuroactive ligand–receptor genes, and a *Malaria* term carried by haemoglobin genes, which reflects slightly less blood in HDM lungs (see the [QC chapter](QC.qmd#tissue-contamination)).
+
+### Gene–pathway network
+
+A network view shows how the leading induced pathways share genes. Pathways that look distinct by name often rest on the same core of cytokines and receptors.
+
+```{r}
+#| label: fig-kegg-cnet
+#| fig-cap: "Gene–concept network for the six most enriched KEGG pathways among HDM-induced genes. Gene nodes are coloured by log2 fold change."
+#| fig-width: 10
+#| fig-height: 8
+
+ora_up <- clusterProfiler::enrichKEGG(up_ids, organism = "mmu", universe = universe_ids,
+                                      pvalueCutoff = 0.05)
+ora_up <- clusterProfiler::setReadable(ora_up, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+ora_up@result$Description <- sub(" - Mus musculus.*$", "", ora_up@result$Description)
+
+fc_vec <- setNames(res$logFC, res$SYMBOL)
+
+p_cnet <- enrichplot::cnetplot(ora_up, showCategory = 6, color.params = list(foldChange = fc_vec),
+                               cex.params = list(gene_label = 0.6, category_label = 0.8)) +
+  scale_colour_gradient2(low = "#2166AC", mid = "grey90", high = "#B2182B", name = "log2FC")
+
+save_plot(p_cnet, "kegg_ora_cnetplot.png", width = 10, height = 8)
+p_cnet
+```
+
+## Gene set enrichment analysis
+
+```{r}
+#| label: kegg-gsea
+
+gsea <- clusterProfiler::gseKEGG(
+  geneList      = gene_list,
+  organism      = "mmu",
+  minGSSize     = 15,
+  maxGSSize     = 500,
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  seed          = TRUE,
+  eps           = 0
+)
+gsea <- clusterProfiler::setReadable(gsea, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+gsea@result$Description <- sub(" - Mus musculus.*$", "", gsea@result$Description)
+
+gsea_tbl <- as.data.frame(gsea)
+readr::write_csv(gsea_tbl, "tables/kegg_gsea_HDM_in_WT.csv")
+```
+
+GSEA finds `r sum(gsea_tbl$NES > 0)` pathways shifted towards induction and `r sum(gsea_tbl$NES < 0)` towards repression (adjusted P < 0.05).
+
+```{r}
+#| label: fig-kegg-gsea
+#| fig-cap: "Top KEGG pathways from GSEA, split by direction (activated = enriched among HDM-induced genes). Dot size is the number of core-enrichment genes; x-axis is the gene ratio."
+#| fig-width: 11
+#| fig-height: 8
+
+p_gsea <- enrichplot::dotplot(gsea, showCategory = 12, split = ".sign", label_format = 45) +
+  facet_grid(. ~ .sign) +
+  theme(axis.text.y = element_text(size = 9))
+
+save_plot(p_gsea, "kegg_gsea_dotplot.png", width = 11, height = 8)
+p_gsea
+```
+
+### Running enrichment scores
+
+Running-score plots show where a pathway's genes fall along the ranked list. A sharp early peak means the pathway's genes sit among the most strongly induced genes. The three plotted pathways are the top-ranked activated pathway, the asthma pathway and the top-ranked suppressed pathway.
+
+```{r}
+#| label: fig-kegg-running
+#| fig-cap: "GSEA running enrichment scores for selected KEGG pathways. Ticks mark pathway genes along the ranked list (left = most HDM-induced)."
+#| fig-width: 10
+#| fig-height: 7
+
+top_up_id   <- gsea_tbl %>% dplyr::filter(NES > 0) %>% dplyr::slice_min(p.adjust, n = 1, with_ties = FALSE) %>% dplyr::pull(ID)
+top_down_id <- gsea_tbl %>% dplyr::filter(NES < 0) %>% dplyr::slice_min(p.adjust, n = 1, with_ties = FALSE) %>% dplyr::pull(ID)
+asthma_id   <- intersect("mmu05310", gsea_tbl$ID)
+
+show_ids <- unique(c(top_up_id, asthma_id, top_down_id))
+
+p_run <- enrichplot::gseaplot2(gsea, geneSetID = show_ids,
+                               title = NULL, base_size = 10,
+                               color = c("#D55E00", "#CC79A7", "#0072B2")[seq_along(show_ids)])
+
+draw_run <- function() print(p_run)
+save_grid(draw_run, "kegg_gsea_running_score.png", width = 10, height = 7)
+p_run
+```
+
+### Ridge plot
+
+The ridge plot shows the distribution of the ranking statistic for core-enrichment genes in each pathway. It gives a feel for how strong and how uniform each pathway's shift is.
+
+```{r}
+#| label: fig-kegg-ridge
+#| fig-cap: "Distribution of signed −log10 P for core-enrichment genes in the top 20 GSEA pathways."
+#| fig-width: 9
+#| fig-height: 9
+
+p_ridge <- enrichplot::ridgeplot(gsea, showCategory = 20, label_format = 45) +
+  labs(x = "Signed −log10 P (core enrichment genes)") +
+  theme(axis.text.y = element_text(size = 9))
+
+save_plot(p_ridge, "kegg_gsea_ridgeplot.png", width = 9, height = 9)
+p_ridge
+```
+
+## From pathways to mechanisms
+
+Many enriched KEGG pathways overlap heavily, and the infection-named pathways (for example *Leishmaniasis* or *Staphylococcus aureus infection*) enter only because they share cytokine, complement and MHC genes. To make the result easier to read, enriched pathways are grouped into broader biological themes with simple keyword rules (see `R/gene_panels.R`). Each induced gene is then assigned to the theme of its most significant pathway.
+
+```{r}
+#| label: mechanism-table
+
+mech <- ora_up@result %>%
+  dplyr::filter(p.adjust < 0.05) %>%
+  dplyr::mutate(theme = assign_kegg_theme(Description)) %>%
+  dplyr::select(Description, theme, p.adjust, geneID) %>%
+  tidyr::separate_rows(geneID, sep = "/") %>%
+  dplyr::rename(SYMBOL = geneID) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::distinct(SYMBOL, .keep_all = TRUE) %>%
+  dplyr::left_join(res %>% dplyr::select(SYMBOL, logFC, FDR), by = "SYMBOL")
+
+readr::write_csv(mech, "tables/genes_by_mechanism.csv")
+```
+
+```{r}
+#| label: tbl-mechanism
+#| tbl-cap: "HDM-induced genes grouped into mechanism themes via their most significant KEGG pathway."
+
+mech %>%
+  dplyr::group_by(Theme = theme) %>%
+  dplyr::summarise(
+    Pathways = dplyr::n_distinct(Description),
+    Genes = dplyr::n(),
+    `Top genes by fold change` = paste(SYMBOL[order(-logFC)][1:min(8, dplyr::n())], collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(Genes)) %>%
+  nice_table()
+```
+
+```{r}
+#| label: fig-mechanism-heatmap
+#| fig-cap: "Expression of HDM-induced genes grouped by mechanism theme (top 12 genes per theme by fold change). Values are row z-scores of logCPM across all four groups."
+#| fig-width: 8
+#| fig-height: 12
+
+mech_plot <- mech %>%
+  dplyr::group_by(theme) %>%
+  dplyr::slice_max(logFC, n = 12, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(theme = factor(theme, levels = names(sort(table(mech$theme), decreasing = TRUE)))) %>%
+  dplyr::arrange(theme, dplyr::desc(logFC)) %>%
+  dplyr::transmute(SYMBOL, block = as.character(theme))
+
+ht_mech <- grouped_zscore_heatmap(logcpm, mech_plot, samples, row_fontsize = 7)
+draw_mech <- function() ComplexHeatmap::draw(ht_mech, merge_legends = TRUE)
+save_grid(draw_mech, "heatmap_mechanisms.png", width = 8, height = 12)
+draw_mech()
+```
